@@ -4,26 +4,39 @@ CLI-first voice assistant with a managed background daemon. Speaks text via TTS,
 
 The daemon keeps models loaded between invocations so subsequent calls are instant. It also runs a macOS audio-io subprocess (VoiceProcessingIO with hardware echo cancellation) that persists across calls.
 
+## Install
+
+```bash
+# Run directly (no install needed)
+uvx talk-mlx "Hello, how are you?"
+
+# Or install from GitHub
+uvx --from git+https://github.com/ochafik/talk talk "Hello!"
+
+# Or run from a local clone
+uv run talk.py "Hello, how are you?"
+```
+
 ## Quick start
 
 ```bash
 # Single mode: speak, listen, show TUI, exit
-uv run talk/server.py "Hello, how are you?"
+talk "Hello, how are you?"
 
 # Continuous mode: interactive loop (default when no text and tty)
-uv run talk/server.py
+talk
 
 # Read text from stdin (single mode)
-echo "What is the weather?" | uv run talk/server.py
+echo "What is the weather?" | talk
 
 # Explicit mode selection
-uv run talk/server.py --mode continuous "Hello"
+talk --mode continuous "Hello"
 
 # Listen only (no TTS)
-uv run talk/server.py -t 10s
+talk -t 10s
 
 # Stop the daemon
-uv run talk/server.py --kill
+talk --kill
 ```
 
 ### TUI output
@@ -51,7 +64,7 @@ The CLI shows a live TUI with TTS and STT streams:
 
 ## Dependencies
 
-All dependencies are declared inline in `server.py` (PEP 723 script metadata) and resolved automatically by `uv run`:
+All dependencies are declared in `pyproject.toml` (and inline in `talk.py` via PEP 723 for standalone script usage) and resolved automatically by `uv`/`uvx`:
 
 - **[pocket-tts-mlx](https://pypi.org/project/pocket-tts-mlx/)** -- MLX text-to-speech
 - **[moshi-mlx](https://pypi.org/project/moshi-mlx/)** -- MLX speech-to-text (Moshi 1B)
@@ -66,7 +79,7 @@ No local dependencies or editable installs required.
 ```
 CLI invocation                   Background daemon (persists)
 ─────────────────               ──────────────────────────────
-./talk/server.py "Hi"  ──POST /talk──>  Starlette HTTP server
+./talk "Hi"  ──POST /talk──>  Starlette HTTP server
                                             │
                        <── NDJSON stream ── ├── TTS (pocket-tts-mlx)
                                             ├── STT (Moshi 1B MLX)
@@ -87,7 +100,7 @@ CLI invocation                   Background daemon (persists)
 ## CLI reference
 
 ```
-talk/server.py [text] [options]
+talk [text] [options]
 
 Positional:
   text                         Text to speak (reads stdin if omitted and not a tty)
@@ -191,7 +204,7 @@ The CLI auto-manages a background daemon:
 - **Auto-start**: First CLI call spawns the daemon, waits for `/health` to respond (up to 60s for model loading), then sends the request.
 - **Reuse**: Subsequent calls read the lockfile (`~/.cache/voice_server/daemon.json`), verify the PID is alive, and reuse the daemon.
 - **Auto-restart**: If `server.py` is modified (mtime changes), the old daemon is killed and a new one starts automatically.
-- **Manual stop**: `uv run talk/server.py --kill` sends SIGTERM, waits, removes the lockfile.
+- **Manual stop**: `talk --kill` sends SIGTERM, waits, removes the lockfile.
 - **Logs**: Daemon stdout/stderr go to `~/.cache/voice_server/daemon.log`.
 
 ## Requirements
