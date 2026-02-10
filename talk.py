@@ -13,6 +13,7 @@
 #     "httpx>=0.27",
 #     "python-multipart>=0.0.9",
 #     "websockets>=14",
+#     "mlx",
 # ]
 #
 # [tool.uv]
