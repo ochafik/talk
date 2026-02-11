@@ -2945,12 +2945,25 @@ async def continuous_mode(
             # Wait for session.created
             await ws.recv()
 
+            stdin_eof = False
+
             while True:
-                # In piped mode with no text, skip listen-only and just read next line
-                if text is None and not is_tty:
+                # In piped mode with no text, read next line (unless stdin closed)
+                if text is None and not is_tty and not stdin_eof:
                     text = await stdin_queue.get()
                     if text is None:
-                        return  # EOF
+                        stdin_eof = True
+                        # Don't return — keep listening for STT events
+                    else:
+                        continue
+
+                if stdin_eof and text is None:
+                    # Stdin exhausted, no text to speak — just consume WS events
+                    raw = await ws.recv()
+                    if isinstance(raw, bytes):
+                        continue
+                    event = json.loads(raw)
+                    renderer.render(event)
                     continue
 
                 result = await _run_ws_with_stdin(
@@ -2960,7 +2973,9 @@ async def continuous_mode(
                 text = None  # consumed
 
                 if result is None:
-                    return  # stdin EOF
+                    stdin_eof = True
+                    # Don't return — keep listening
+                    continue
                 elif isinstance(result, str):
                     text = result  # new text from stdin
                     continue
