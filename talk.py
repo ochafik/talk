@@ -441,18 +441,18 @@ def get_stt_engine():
     return _stt_engine
 
 
-# ── Embedded Swift audio-io binary (macOS VoiceProcessingIO + echo cancellation) ──
+# ── Embedded Swift talk-audio-io binary (macOS VoiceProcessingIO + echo cancellation) ──
 
 AUDIO_IO_PACKAGE_SWIFT = """\
 // swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
-    name: "audio-io",
+    name: "talk-audio-io",
     platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
-            name: "audio-io",
+            name: "talk-audio-io",
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("AudioToolbox"),
@@ -466,7 +466,7 @@ let package = Package(
 AUDIO_IO_MAIN_SWIFT = """\
 import Foundation
 
-/// audio-io: Bidirectional audio I/O with echo cancellation via VoiceProcessingIO
+/// talk-audio-io: Bidirectional audio I/O with echo cancellation via VoiceProcessingIO
 ///
 /// stdin:  Int16 PCM 24kHz mono → speakers (with AEC reference)
 /// stdout: echo-cancelled mic → Int16 PCM 24kHz mono
@@ -474,7 +474,7 @@ import Foundation
 /// SIGUSR1: flush playback buffer (barge-in)
 
 func log(_ message: String) {
-    FileHandle.standardError.write("[audio-io] \\(message)\\n".data(using: .utf8)!)
+    FileHandle.standardError.write("[talk-audio-io] \\(message)\\n".data(using: .utf8)!)
 }
 
 // Parse sample rate from args (default 48000)
@@ -590,6 +590,15 @@ signal(SIGINT) { _ in
 signal(SIGTERM) { _ in
     engine.shouldStop = true
 }
+
+// Monitor parent process — exit if parent dies (prevents orphan zombies)
+let parentPID = getppid()
+let parentSource = DispatchSource.makeProcessSource(identifier: parentPID, eventMask: .exit)
+parentSource.setEventHandler {
+    log("Parent process (pid=\\(parentPID)) exited — shutting down")
+    engine.shouldStop = true
+}
+parentSource.resume()
 
 // Run loop to keep process alive
 log("Ready")
@@ -1149,11 +1158,11 @@ AUDIO_IO_SOURCES = {
     "Sources/SampleRateConverter.swift": AUDIO_IO_SRC_CONVERTER_SWIFT,
 }
 
-AUDIO_IO_VERSION = "v1"
+AUDIO_IO_VERSION = "v2"
 
 
 def _get_audio_io_cache_dir() -> Path:
-    """Return cache directory for audio-io, creating if needed."""
+    """Return cache directory for talk-audio-io, creating if needed."""
     return Path.home() / ".cache" / "voice_server" / f"audio-io-{AUDIO_IO_VERSION}"
 
 
@@ -1166,22 +1175,22 @@ def _extract_audio_io_sources(target_dir: Path) -> None:
 
 
 def ensure_audio_io() -> Path | None:
-    """Return path to audio-io binary, building from embedded source on first run."""
+    """Return path to talk-audio-io binary, building from embedded source on first run."""
     if platform.system() != "Darwin":
         return None
 
     cache_dir = _get_audio_io_cache_dir()
-    binary_path = cache_dir / ".build" / "release" / "audio-io"
+    binary_path = cache_dir / ".build" / "release" / "talk-audio-io"
 
     if binary_path.exists():
         return binary_path
 
     if not shutil.which("swift"):
         logger.warning("swift not found — install Xcode Command Line Tools "
-                       "(xcode-select --install) to enable audio-io")
+                       "(xcode-select --install) to enable talk-audio-io")
         return None
 
-    logger.info("Building audio-io from embedded source (first run)...")
+    logger.info("Building talk-audio-io from embedded source (first run)...")
     cache_dir.mkdir(parents=True, exist_ok=True)
     _extract_audio_io_sources(cache_dir)
 
@@ -1191,17 +1200,17 @@ def ensure_audio_io() -> Path | None:
             cwd=cache_dir, check=True,
         )
     except subprocess.CalledProcessError:
-        logger.error("Failed to build audio-io")
+        logger.error("Failed to build talk-audio-io")
         return None
 
     if not binary_path.exists():
-        binary_path = cache_dir / ".build" / "arm64-apple-macosx" / "release" / "audio-io"
+        binary_path = cache_dir / ".build" / "arm64-apple-macosx" / "release" / "talk-audio-io"
 
     if not binary_path.exists():
-        logger.error("audio-io binary not found after build")
+        logger.error("talk-audio-io binary not found after build")
         return None
 
-    logger.info("audio-io built successfully: %s", binary_path)
+    logger.info("talk-audio-io built successfully: %s", binary_path)
     return binary_path
 
 
@@ -1275,18 +1284,35 @@ def _emit(session: TalkSession, event: dict) -> None:
 # ── Audio Pipeline ───────────────────────────────────────────────────────────
 
 async def start_audio_pipeline(session: TalkSession) -> None:
-    """Spawn audio-io subprocess and start capture + drain loops."""
+    """Spawn talk-audio-io subprocess and start capture + drain loops."""
     audio_io_bin = ensure_audio_io()
     if audio_io_bin is None:
-        logger.error("audio-io not available — no audio pipeline")
+        logger.error("talk-audio-io not available — no audio pipeline")
         return
 
+    session.shutting_down = False
     session.audio_process = subprocess.Popen(
         [str(audio_io_bin)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    # Wait for audio-io to be ready before starting capture/drain loops.
+    # Without this, the loops may see immediate EOF if audio-io is still
+    # initializing CoreAudio (especially on respawn after a previous stop).
+    import select
+    for _ in range(20):  # up to ~1s
+        rc = session.audio_process.poll()
+        if rc is not None:
+            err = session.audio_process.stderr.read().decode(errors="replace").strip() if session.audio_process.stderr else ""
+            logger.error("talk-audio-io exited immediately (rc=%s): %s", rc, err)
+            session.audio_process = None
+            return
+        if select.select([session.audio_process.stderr], [], [], 0.05)[0]:
+            line = session.audio_process.stderr.readline()
+            if line and b"Ready" in line:
+                break
+
     session.capture_task = asyncio.create_task(
         audio_capture_loop(session, session.audio_process.stdout)
     )
@@ -1297,7 +1323,7 @@ async def start_audio_pipeline(session: TalkSession) -> None:
 
 
 async def audio_capture_loop(session: TalkSession, stdout) -> None:
-    """Read audio from audio-io stdout, feed to STT session, run VAD."""
+    """Read audio from talk-audio-io stdout, feed to STT session, run VAD."""
     loop = asyncio.get_event_loop()
     frame_count = 0
 
@@ -1305,7 +1331,7 @@ async def audio_capture_loop(session: TalkSession, stdout) -> None:
         while not session.shutting_down:
             data = await loop.run_in_executor(None, stdout.read, FRAME_BYTES)
             if not data:
-                logger.warning("Audio capture: stdout EOF — audio-io may have died")
+                logger.warning("Audio capture: stdout EOF — talk-audio-io may have died")
                 break
 
             frame_count += 1
@@ -1462,13 +1488,13 @@ def _finalize_transcript(session: TalkSession) -> None:
 
 
 async def drain_monitor_loop(session: TalkSession, stderr) -> None:
-    """Monitor audio-io stderr for DRAINED signals."""
+    """Monitor talk-audio-io stderr for DRAINED signals."""
     loop = asyncio.get_event_loop()
     try:
         while not session.shutting_down:
             line = await loop.run_in_executor(None, stderr.readline)
             if not line:
-                logger.warning("Drain monitor: stderr EOF — audio-io may have died")
+                logger.warning("Drain monitor: stderr EOF — talk-audio-io may have died")
                 break
             text = line.decode().strip()
             if text == "DRAINED":
@@ -1485,7 +1511,7 @@ async def drain_monitor_loop(session: TalkSession, stderr) -> None:
 
 
 async def send_audio_to_output(session: TalkSession, audio_int16_bytes: bytes) -> None:
-    """Write TTS audio to audio-io stdin."""
+    """Write TTS audio to talk-audio-io stdin."""
     if session.audio_process and session.audio_process.stdin:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, session.audio_process.stdin.write, audio_int16_bytes)
@@ -1493,7 +1519,7 @@ async def send_audio_to_output(session: TalkSession, audio_int16_bytes: bytes) -
 
 
 def _flush_audio_output(session: TalkSession) -> None:
-    """Send SIGUSR1 to audio-io for barge-in flush."""
+    """Send SIGUSR1 to talk-audio-io for barge-in flush."""
     if session.audio_process:
         try:
             session.audio_process.send_signal(signal.SIGUSR1)
@@ -1502,7 +1528,7 @@ def _flush_audio_output(session: TalkSession) -> None:
 
 
 def stop_audio_pipeline(session: TalkSession) -> None:
-    """Terminate audio-io subprocess and cancel async tasks."""
+    """Terminate talk-audio-io subprocess and cancel async tasks."""
     session.shutting_down = True
     if session.capture_task and not session.capture_task.done():
         session.capture_task.cancel()
@@ -1530,7 +1556,7 @@ _SENTENCE_RE = re.compile(r'[^.!?\n]+[.!?\n]+\s*|[^.!?\n]+$')
 
 
 async def generate_and_play_tts(session: TalkSession, text: str, voice: str) -> None:
-    """Generate TTS audio and feed to audio-io or WS output.
+    """Generate TTS audio and feed to talk-audio-io or WS output.
 
     Splits text into sentences for progressive generation — first sentence
     starts playing quickly, model lock is released between sentences for STT.
@@ -2163,6 +2189,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             if not _ws_builtin_lock.locked():
                 await _ws_builtin_lock.acquire()
             session = get_session()
+            # Start audio pipeline on demand (stopped when WS disconnects)
+            if session.audio_process is None:
+                await start_audio_pipeline(session)
             # Ensure STT session is active for mic audio
             if session.stt_session is None:
                 await _ws_start_stt(session)
@@ -2259,6 +2288,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             if ext_audio_queue:
                 await ext_audio_queue.put(None)  # signal loop to exit
             ext_capture.cancel()
+        if not is_external and session:
+            stop_audio_pipeline(session)
         if not is_external and _ws_builtin_lock.locked():
             _ws_builtin_lock.release()
         logger.info("WS connection closed (audio=%s)", config.get("audio"))
@@ -2266,7 +2297,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
 # ── App Composition ──────────────────────────────────────────────────────────
 
-def create_app(start_audio: bool = False) -> Starlette:
+def create_app() -> Starlette:
     routes = [
         Route("/", index),
         Route("/health", health),
@@ -2275,13 +2306,7 @@ def create_app(start_audio: bool = False) -> Starlette:
         Route("/v1/audio/speech", openai_speech, methods=["POST"]),
         WebSocketRoute("/ws", ws_endpoint),
     ]
-
-    async def on_startup():
-        if start_audio:
-            session = get_session()
-            await start_audio_pipeline(session)
-
-    return Starlette(routes=routes, on_startup=[on_startup])
+    return Starlette(routes=routes)
 
 
 # ── Daemon Management ────────────────────────────────────────────────────────
@@ -2385,9 +2410,14 @@ def ensure_daemon(port: int) -> tuple[int, int]:
 
     proc = subprocess.Popen(
         [sys.executable, __file__, "--foreground", "--port", str(port)],
+        stdin=subprocess.DEVNULL,
         stdout=log_file,
         stderr=log_file,
-        start_new_session=True,  # detach from parent
+        # Use preexec_fn=os.setpgrp to create a new *process group* (survives
+        # parent exit) without creating a new *session* — start_new_session=True
+        # would call setsid() which on macOS loses the login session's audio
+        # server, breaking CoreAudio/VoiceProcessingIO in talk-audio-io.
+        preexec_fn=os.setpgrp,
     )
 
     _write_lockfile(proc.pid, port)
@@ -2852,30 +2882,32 @@ async def single_mode(
     import websockets
 
     renderer = TUIRenderer(tty=is_tty)
-    async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {"audio": "builtin", "voice": voice},
-        }))
-        # Wait for session.created
-        await ws.recv()
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
+            await ws.send(json.dumps({
+                "type": "session.update",
+                "session": {"audio": "builtin", "voice": voice},
+            }))
+            # Wait for session.created
+            await ws.recv()
 
-        if text is not None:
-            await ws.send(json.dumps({"type": "speak", "text": text}))
+            if text is not None:
+                await ws.send(json.dumps({"type": "speak", "text": text}))
 
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                continue
-            event = json.loads(raw)
-            renderer.render(event)
-            etype = event.get("type")
-            if etype in ("speak.done", "tts_done"):
-                # In single mode without timeout, wait briefly for transcript
-                if timeout_val is None:
+            async for raw in ws:
+                if isinstance(raw, bytes):
                     continue
-            if etype in ("transcript.final", "stt_final", "done"):
-                break
-    sys.stdout.write("\n")
+                event = json.loads(raw)
+                renderer.render(event)
+                etype = event.get("type")
+                if etype in ("speak.done", "tts_done"):
+                    # In single mode without timeout, wait briefly for transcript
+                    if timeout_val is None:
+                        continue
+                if etype in ("transcript.final", "stt_final", "done"):
+                    break
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
 
 
 async def continuous_mode(
@@ -3008,6 +3040,11 @@ Examples:
 
         atexit.register(_cleanup)
 
+        def _handle_sigterm(signum, frame):
+            _cleanup()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+
         # Preload models
         if "stt" in args.preload:
             global _stt_engine
@@ -3019,7 +3056,7 @@ Examples:
         _write_lockfile(os.getpid(), args.port)
 
         import uvicorn
-        app = create_app(start_audio=True)
+        app = create_app()
         logger.info("Starting voice server at http://%s:%d", args.host, args.port)
         logger.info("  Health:  http://%s:%d/health", args.host, args.port)
         logger.info("  Talk:    http://%s:%d/talk", args.host, args.port)
@@ -3075,12 +3112,20 @@ Examples:
                                         input_mode=input_mode,
                                         is_tty=is_tty))
     except KeyboardInterrupt:
-        sys.stdout.write("\n")
-        sys.exit(130)
+        pass
+    finally:
+        sys.stdout.write(RESET + "\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
+    # Suppress noisy tracebacks on Ctrl+C — just exit silently.
     try:
         main()
     except KeyboardInterrupt:
+        sys.stdout.write("\033[0m\n")
+        sys.stdout.flush()
+    except SystemExit:
+        raise
+    except Exception:
         pass
